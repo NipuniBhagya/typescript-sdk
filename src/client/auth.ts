@@ -85,29 +85,57 @@ export class UnauthorizedError extends Error {
 export async function auth(
   provider: OAuthClientProvider,
   { serverUrl, authorizationCode }: { serverUrl: string | URL, authorizationCode?: string }): Promise<AuthResult> {
+    let protectedMeta;
+    const authzUrlBase = typeof serverUrl === "string" ? serverUrl : serverUrl.toString();
+    if (authzUrlBase.includes("/.well-known/oauth-protected-resource")) {
+        protectedMeta = await discoverProtectedResourceMetadata(serverUrl);
+        if (protectedMeta.scopes_supported) {
+            const s = protectedMeta.scopes_supported;
+            if (Array.isArray(s)) {
+              provider.clientMetadata.scope = s.join(" ");
+            } else if (typeof s === "object") {
+              const scopes = Object.values(s);
+              const unique = Array.from(new Set(scopes));
+              provider.clientMetadata.scope = unique.join(" ");
+            } else if (typeof s === "string") {
+                provider.clientMetadata.scope = s;
+            } else {
+              throw new Error(
+                `unsupported scopes_supported type ${typeof s}`
+              );
+            }
+        }
+        
+        const issuer = protectedMeta.authorization_servers[0].replace(/\/+$|\/$/, "");
+        serverUrl = new URL(issuer);
+    }
+
   const metadata = await discoverOAuthMetadata(serverUrl);
 
-  // Handle client registration if needed
-  let clientInformation = await Promise.resolve(provider.clientInformation());
+  let clientInformation = await Promise.resolve(
+    provider.clientInformation()
+  );
   if (!clientInformation) {
     if (authorizationCode !== undefined) {
-      throw new Error("Existing OAuth client information is required when exchanging an authorization code");
+      throw new Error(
+        "Existing OAuth client information is required when exchanging an authorization code"
+      );
     }
 
     if (!provider.saveClientInformation) {
-      throw new Error("OAuth client information must be saveable for dynamic registration");
+      throw new Error(
+        "OAuth client information must be saveable for dynamic registration"
+      );
     }
-
-    const fullInformation = await registerClient(serverUrl, {
+    const fullInfo = await registerClient(serverUrl, {
       metadata,
-      clientMetadata: provider.clientMetadata,
+      clientMetadata: provider.clientMetadata
     });
 
-    await provider.saveClientInformation(fullInformation);
-    clientInformation = fullInformation;
+    await provider.saveClientInformation(fullInfo);
+    clientInformation = fullInfo;
   }
 
-  // Exchange authorization code for tokens
   if (authorizationCode !== undefined) {
     const codeVerifier = await provider.codeVerifier();
     const tokens = await exchangeAuthorization(serverUrl, {
@@ -115,7 +143,7 @@ export async function auth(
       clientInformation,
       authorizationCode,
       codeVerifier,
-      redirectUri: provider.redirectUrl,
+      redirectUri: provider.redirectUrl
     });
 
     await provider.saveTokens(tokens);
@@ -123,21 +151,17 @@ export async function auth(
   }
 
   const tokens = await provider.tokens();
-
-  // Handle token refresh or new authorization
   if (tokens?.refresh_token) {
     try {
-      // Attempt to refresh the token
       const newTokens = await refreshAuthorization(serverUrl, {
         metadata,
         clientInformation,
-        refreshToken: tokens.refresh_token,
+        refreshToken: tokens.refresh_token
       });
-
       await provider.saveTokens(newTokens);
       return "AUTHORIZED";
-    } catch (error) {
-      console.error("Could not refresh OAuth tokens:", error);
+    } catch (_) {
+      console.error("Could not refresh OAuth tokens");
     }
   }
 
@@ -145,53 +169,35 @@ export async function auth(
   const { authorizationUrl, codeVerifier } = await startAuthorization(serverUrl, {
     metadata,
     clientInformation,
-    redirectUrl: provider.redirectUrl
+    redirectUrl: provider.redirectUrl,
+    scope: "openid profile email mcp_proxy"
   });
 
+  console.log("Starting authorization flow with URL:", authorizationUrl.toString());
   await provider.saveCodeVerifier(codeVerifier);
+  console.log("Saved code verifier");
   await provider.redirectToAuthorization(authorizationUrl);
+  console.log("Redirected to authorization URL");
   return "REDIRECT";
 }
 
 /**
- * Looks up RFC 8414 OAuth 2.0 Authorization Server Metadata.
- *
- * If the server returns a 404 for the well-known endpoint, this function will
- * return `undefined`. Any other errors will be thrown as exceptions.
+ * Discover Protected-Resource Metadata (RFC 9728)
  */
-export async function discoverOAuthMetadata(
-  serverUrl: string | URL,
-  opts?: { protocolVersion?: string },
-): Promise<OAuthMetadata | undefined> {
-  const url = new URL("/.well-known/oauth-authorization-server", serverUrl);
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      headers: {
-        "MCP-Protocol-Version": opts?.protocolVersion ?? LATEST_PROTOCOL_VERSION
-      }
+export async function discoverProtectedResourceMetadata(serverUrl: string | URL) {
+    const url = typeof serverUrl === "string" ? serverUrl : serverUrl.toString();
+    const res = await fetch(url, {
+      headers: { "MCP-Protocol-Version": LATEST_PROTOCOL_VERSION }
     });
-  } catch (error) {
-    // CORS errors come back as TypeError
-    if (error instanceof TypeError) {
-      response = await fetch(url);
-    } else {
-      throw error;
+
+    if (!res.ok) {
+      throw new Error(
+        `HTTP ${res.status} trying to load protected-resource metadata`
+      );
     }
-  }
 
-  if (response.status === 404) {
-    return undefined;
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `HTTP ${response.status} trying to load well-known OAuth metadata`,
-    );
-  }
-
-  return OAuthMetadataSchema.parse(await response.json());
-}
+    return await res.json();
+} 
 
 /**
  * Begins the authorization flow with the given server, by generating a PKCE challenge and constructing the authorization URL.
@@ -202,10 +208,12 @@ export async function startAuthorization(
     metadata,
     clientInformation,
     redirectUrl,
+    scope,
   }: {
     metadata?: OAuthMetadata;
     clientInformation: OAuthClientInformation;
     redirectUrl: string | URL;
+    scope?: string;
   },
 ): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
   const responseType = "code";
@@ -246,6 +254,10 @@ export async function startAuthorization(
     codeChallengeMethod,
   );
   authorizationUrl.searchParams.set("redirect_uri", String(redirectUrl));
+  authorizationUrl.searchParams.set("audience", "mcp_proxy");
+  if (scope) {
+    authorizationUrl.searchParams.set("scope", scope);
+  }
 
   return { authorizationUrl, codeVerifier };
 }
@@ -294,6 +306,8 @@ export async function exchangeAuthorization(
     code: authorizationCode,
     code_verifier: codeVerifier,
     redirect_uri: String(redirectUri),
+    audience: "mcp_proxy",
+    scope: "openid profile email mcp_proxy",
   });
 
   if (clientInformation.client_secret) {
@@ -412,4 +426,65 @@ export async function registerClient(
   }
 
   return OAuthClientInformationFullSchema.parse(await response.json());
+}
+
+async function fetchMaybe(
+  url: URL,
+  init?: RequestInit
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    if (err instanceof TypeError) {
+        return await fetch(url);
+    }
+    throw err;
+  }
+}
+
+export async function discoverOAuthMetadata(
+  serverUrl: string | URL,
+  opts?: { protocolVersion?: string }
+): Promise<OAuthMetadata> {
+  const base = typeof serverUrl === "string" ? serverUrl : serverUrl.toString();
+  const headers = {
+    "MCP-Protocol-Version": opts?.protocolVersion ?? LATEST_PROTOCOL_VERSION,
+  };
+
+  const oauthUrl = new URL("/.well-known/oauth-authorization-server", base);
+  let oauthResp: Response;
+  try {
+    oauthResp = await fetchMaybe(oauthUrl, { headers });
+  } catch (e) {
+    // If OAuth endpoint fails completely, try OIDC
+    return await discoverViaOidc(base, headers);
+  }
+
+  if (oauthResp.ok) {
+    const payload = await oauthResp.json();
+    return OAuthMetadataSchema.parse(payload);
+  }
+
+  // 404 / 401 / 403 from the OAuth endpoint → fallback to OIDC
+  if ([404, 401, 403].includes(oauthResp.status)) {
+    return await discoverViaOidc(base, headers);
+  }
+
+  // any other HTTP error is fatal
+  throw new Error(`OAuth metadata discovery failed: HTTP ${oauthResp.status}`);
+}
+
+async function discoverViaOidc(
+  base: string,
+  headers: Record<string,string>
+): Promise<OAuthMetadata> {
+  const oidcUrl = new URL("/.well-known/openid-configuration", base);
+  const oidcResp = await fetchMaybe(oidcUrl, { headers });
+
+  if (!oidcResp.ok) {
+    throw new Error(`OIDC discovery failed: HTTP ${oidcResp.status}`);
+  }
+
+  const doc = await oidcResp.json();
+  return OAuthMetadataSchema.parse(doc);
 }
